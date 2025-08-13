@@ -1,0 +1,796 @@
+
+local ffi = require 'ffi'
+
+if not pcall(ffi.cdef, [[
+    struct animstate_t {
+        char pad[3];
+        char m_bForceWeaponUpdate;
+        char pad1[91];
+        void* m_pBaseEntity;
+        void* m_pActiveWeapon;
+        void* m_pLastActiveWeapon;
+        float m_flLastClientSideAnimationUpdateTime;
+        int m_iLastClientSideAnimationUpdateFramecount;
+        float m_flAnimUpdateDelta;
+        float m_flEyeYaw;
+        float m_flPitch;
+        float m_flGoalFeetYaw;
+        float m_flCurrentFeetYaw;
+        float m_flCurrentTorsoYaw;
+        float m_flUnknownVelocityLean;
+        float m_flLeanAmount;
+        char pad2[4];
+        float m_flFeetCycle;
+        float m_flFeetYawRate;
+        char pad3[4];
+        float m_fDuckAmount;
+        float m_fLandingDuckAdditiveSomething;
+        char pad4[4];
+        float m_vOriginX;
+        float m_vOriginY;
+        float m_vOriginZ;
+        float m_vLastOriginX;
+        float m_vLastOriginY;
+        float m_vLastOriginZ;
+        float m_vVelocityX;
+        float m_vVelocityY;
+        char pad5[4];
+        float m_flUnknownFloat1;
+        char pad6[8];
+        float m_flUnknownFloat2;
+        float m_flUnknownFloat3;
+        float m_flUnknown;
+        float m_flSpeed2D;
+        float m_flUpVelocity;
+        float m_flSpeedNormalized;
+        float m_flFeetSpeedForwardsOrSideWays;
+        float m_flFeetSpeedUnknownForwardOrSideways;
+        float m_flTimeSinceStartedMoving;
+        float m_flTimeSinceStoppedMoving;
+        bool m_bOnGround;
+        bool m_bInHitGroundAnimation;
+        char pad7[2];
+        float m_flJumpToFall;
+        float m_flTimeSinceInAir;
+        float m_flLastOriginZ;
+        float m_flHeadHeightOrOffsetFromHittingGroundAnimation;
+        float m_flStopToFullRunningFraction;
+        char pad8[4];
+        float m_flMagicFraction;
+        char pad9[60];
+        float m_flWorldForce;
+        char pad10[462];
+        float m_flMaxYaw;
+    };
+
+    struct animation_layer_t {
+        char pad_0000[20];
+        uint32_t m_nOrder;
+        uint32_t m_nSequence;
+        float m_flPrevCycle;
+        float m_flWeight;
+        float m_flWeightDeltaRate;
+        float m_flPlaybackRate;
+        float m_flCycle;
+        void* m_pOwner;
+        char pad_0038[4];
+    };
+
+    typedef struct { float x, y, z; } Vector;
+]]) then end
+
+local function get_animstate(player)
+    local addr = entity.get_prop(player, "m_AnimOverlay")
+    if addr == 0 or addr == nil then return nil end
+    return ffi.cast('struct animstate_t*', addr - 0x10)
+end
+
+local function get_anim_layer(player, idx)
+    local addr = entity.get_prop(player, "m_AnimOverlay")
+    if addr == 0 or addr == nil then return nil end
+    return ffi.cast('struct animation_layer_t*', addr + idx * 0x38)
+end
+
+local function get_velocity_2d(vec)
+    return math.sqrt(vec.x * vec.x + vec.y * vec.y)
+end
+
+local function get_velocity_3d(vec)
+    return math.sqrt(vec.x * vec.x + vec.y * vec.y + vec.z * vec.z)
+end
+
+local function is_moving(player)
+    local vx = entity.get_prop(player, "m_vecVelocity[0]") or 0
+    local vy = entity.get_prop(player, "m_vecVelocity[1]") or 0
+    return get_velocity_2d({x = vx, y = vy}) > 0.5
+end
+
+local function is_swimming(flags)
+    return bit.band(flags, 2) ~= 0
+end
+
+local function is_on_ground(flags)
+    return bit.band(flags, 1) ~= 0
+end
+
+local function is_onground_or_swimming(flags)
+    return is_on_ground(flags) or is_swimming(flags)
+end
+
+local function get_flags(player)
+    return entity.get_prop(player, "m_fFlags") or 0
+end
+
+local function get_duck_amount(player)
+    return entity.get_prop(player, "m_flDuckAmount") or 0
+end
+
+local function get_tickbase(player)
+    return entity.get_prop(player, "m_nTickBase") or 0
+end
+
+local function get_abs_yaw(player)
+    return entity.get_prop(player, "m_angEyeAngles[1]") or 0
+end
+
+local function normalize_yaw(yaw)
+    while yaw > 180 do yaw = yaw - 360 end
+    while yaw < -180 do yaw = yaw + 360 end
+    return yaw
+end
+
+local function angle_diff(a, b)
+    local diff = math.abs(normalize_yaw(a - b))
+    return diff > 180 and 360 - diff or diff
+end
+
+local function lerp(a, b, t)
+    return a + (b - a) * t
+end
+
+local function approach_angle(target, current, speed)
+    local diff = normalize_yaw(target - current)
+    if math.abs(diff) <= speed then
+        return target
+    end
+    return current + (diff > 0 and speed or -speed)
+end
+
+local function is_breaking_lby(data)
+    local cycle = data.animstate.feet_cycle
+    return (cycle > 0.9 or cycle < 0.1) and not data.in_air
+end
+
+local function get_sequence_activity(player, sequence)
+    local model = entity.get_model(player)
+    if not model then return -1 end
+    local studio_hdr = client.find_signature("client_panorama.dll", "55 8B EC 51 56 8B F1 85") ~= 0 and 
+        ffi.cast("void*(__thiscall*)(void*, const void*)", client.find_signature("client_panorama.dll", "55 8B EC 51 56 8B F1 85"))(client.create_interface("engine.dll", "VModelInfoClient004"), model)
+    if not studio_hdr then return -1 end
+    local fn = client.find_signature("client_panorama.dll", "55 8B EC 53 8B 5D 08 56 8B F1")
+    if fn == 0 then return -1 end
+    return ffi.cast("int(__fastcall*)(void*, void*, int)", fn)(player, studio_hdr, sequence)
+end
+
+local function get_layer_activity(player, layer)
+    local sequence = layer.m_nSequence
+    return get_sequence_activity(player, sequence)
+end
+
+local function is_firing_weapon(player)
+    local active_weapon = entity.get_prop(player, "m_hActiveWeapon")
+    if active_weapon == nil then return false end
+    local weapon = entity.get_entity_from_handle(active_weapon)
+    if not weapon then return false end
+    local next_attack = entity.get_prop(weapon, "m_flNextPrimaryAttack")
+    local curtime = globals.curtime()
+    return next_attack ~= nil and next_attack <= curtime + 0.1
+end
+
+local function get_max_desync_delta()
+    return 58.0
+end
+
+local function calculate_speed_penalty(velocity)
+    local speed = get_velocity_2d(velocity)
+    return math.min(speed / 260.0, 1.0)
+end
+
+local function is_jittering(data)
+    local history = data.history
+    if #history < 3 then return false end
+    local a = history[1].feet_yaw
+    local b = history[2].feet_yaw
+    local c = history[3].feet_yaw
+    return math.abs(a - b) > 30 and math.abs(b - c) > 30
+end
+
+local function predict_desync(data)
+    if data.moving then return data.animstate.eye_yaw end
+    if is_jittering(data) then return data.animstate.current_feet_yaw end
+    if data.animstate.on_ground and not data.ducking and data.last_velocity < 1.0 then
+        return data.lby + 180
+    end
+    return data.animstate.goal_feet_yaw
+end
+
+local function get_brute_force_angle(base_yaw, step)
+    local angles = {
+        base_yaw,
+        base_yaw + 58,
+        base_yaw - 58,
+        base_yaw + 25,
+        base_yaw - 25,
+        base_yaw + 45,
+        base_yaw - 45,
+        base_yaw + 15,
+        base_yaw - 15
+    }
+    return angles[(step % #angles) + 1]
+end
+
+local function is_teleport(data)
+    local vel = get_velocity_2d(data.velocity)
+    if vel > 300 then return true end
+    if data.stuck_ticks > 10 then return true end
+    return false
+end
+
+local function get_ground_friction()
+    return 0.02
+end
+
+local function simulate_friction(velocity, tick_interval)
+    local speed = get_velocity_2d(velocity)
+    if speed < 0.1 then return {x=0,y=0,z=velocity.z} end
+    local drop = speed * get_ground_friction() * tick_interval
+    local factor = math.max(0, speed - drop) / speed
+    return {x = velocity.x * factor, y = velocity.y * factor, z = velocity.z}
+end
+
+local function simulate_gravity(velocity, tick_interval)
+    return {x = velocity.x, y = velocity.y, z = velocity.z - 800 * tick_interval}
+end
+
+local function is_valid_velocity(velocity)
+    return velocity.x ~= nil and velocity.y ~= nil and velocity.z ~= nil and
+           math.abs(velocity.x) < 5000 and math.abs(velocity.y) < 5000 and math.abs(velocity.z) < 5000
+end
+
+local function extrapolate_position_advanced(origin, velocity, ticks, on_ground, duck_amount)
+    local pos = {x = origin.x, y = origin.y, z = origin.z}
+    local vel = {x = velocity.x, y = velocity.y, z = velocity.z}
+    local tick_interval = globals.tickinterval()
+    if tick_interval == 0 then return origin end
+
+    for i = 1, math.floor(ticks) do
+        if not is_valid_velocity(vel) then break end
+
+        if on_ground then
+            vel = simulate_friction(vel, tick_interval)
+            vel.z = 0
+        else
+            vel = simulate_gravity(vel, tick_interval)
+        end
+
+        pos.x = pos.x + vel.x * tick_interval
+        pos.y = pos.y + vel.y * tick_interval
+        pos.z = pos.z + vel.z * tick_interval
+    end
+
+    return pos
+end
+
+local function get_player_height(player, duck_amount)
+    return duck_amount > 0.5 and 45 or 72
+end
+
+local function is_player_valid(player)
+    if not player then return false end
+    if not entity.is_enemy(player) then return false end
+    if entity.get_prop(player, "m_iHealth") <= 0 then return false end
+    return true
+end
+
+local function get_total_latency()
+    local outgoing = engine.get_latency(e_latency_flows.OUTGOING) or 0
+    local incoming = engine.get_latency(e_latency_flows.INCOMING) or 0
+    return outgoing + incoming
+end
+
+local function get_interpolation_ticks()
+    local latency = get_total_latency()
+    local tick_interval = globals.tickinterval()
+    if tick_interval == 0 then return 0 end
+    return latency / tick_interval
+end
+
+local resolver_data = {}
+
+local function get_player_data(player)
+    local idx = entity.get_index(player)
+    if not resolver_data[idx] then
+        resolver_data[idx] = {
+            tickcount = 0,
+            origin = {x=0,y=0,z=0},
+            velocity = {x=0,y=0,z=0},
+            eye_angles = {x=0,y=0},
+            animstate = {
+                goal_feet_yaw = 0,
+                current_feet_yaw = 0,
+                eye_yaw = 0,
+                feet_cycle = 0,
+                time_in_air = 0,
+                on_ground = true,
+                duck_amount = 0
+            },
+            flags = 0,
+            ducking = false,
+            in_air = false,
+            moving = false,
+            lby_updated = false,
+            lby = 0,
+            last_lby = 0,
+            lby_time = 0,
+            last_update_time = 0,
+            shot_time = 0,
+            last_velocity = 0,
+            stuck_ticks = 0,
+            resolver_mode = 0,
+            last_yaw = 0,
+            last_move_state = 0,
+            last_origin = {x=0,y=0,z=0},
+            history = {},
+            resolved_angles = {},
+            brute_force_step = 0,
+            last_brute = 0,
+            teleport_detected = false,
+            velocity_penalty = 0,
+            in_air_time = 0,
+            last_ground_z = 0,
+            last_feet_yaw = 0,
+            last_goal_feet_yaw = 0,
+            last_on_ground = true,
+            stuck_origin = {x=0,y=0,z=0},
+            last_lby_delta = 0,
+            resolve_stage = 0,
+            last_resolve_time = 0,
+            missed_shots = 0,
+            hit_counter = 0,
+            last_hit_time = 0,
+            resolve_override = false,
+            backtrack_records = {}
+        }
+    end
+    return resolver_data[idx]
+end
+
+local function update_player_data(player)
+    local data = get_player_data(player)
+    local now = globals.tickcount()
+    local flags = get_flags(player)
+
+    data.tickcount = now
+    data.flags = flags
+    data.in_air = not is_on_ground(flags)
+    data.moving = is_moving(player)
+    data.ducking = get_duck_amount(player) > 0.5
+
+    local ox = entity.get_prop(player, "m_vecOrigin[0]")
+    local oy = entity.get_prop(player, "m_vecOrigin[1]")
+    local oz = entity.get_prop(player, "m_vecOrigin[2]")
+    local vx = entity.get_prop(player, "m_vecVelocity[0]")
+    local vy = entity.get_prop(player, "m_vecVelocity[1]")
+    local vz = entity.get_prop(player, "m_vecVelocity[2]")
+
+    if ox ~= nil then
+        data.last_origin = {x = data.origin.x, y = data.origin.y, z = data.origin.z}
+        data.origin = {x = ox, y = oy, z = oz}
+    end
+    data.velocity = {x = vx or 0, y = vy or 0, z = vz or 0}
+
+    local animstate = get_animstate(player)
+    if animstate ~= nil then
+        data.animstate.goal_feet_yaw = animstate.m_flGoalFeetYaw
+        data.animstate.current_feet_yaw = animstate.m_flCurrentFeetYaw
+        data.animstate.eye_yaw = animstate.m_flEyeYaw
+        data.animstate.feet_cycle = animstate.m_flFeetCycle
+        data.animstate.time_in_air = animstate.m_flTimeSinceInAir
+        data.animstate.on_ground = animstate.m_bOnGround
+        data.animstate.duck_amount = animstate.m_fDuckAmount
+    end
+
+    data.eye_angles.x = entity.get_prop(player, "m_angEyeAngles[0]") or 0
+    data.eye_angles.y = entity.get_prop(player, "m_angEyeAngles[1]") or 0
+
+    local lby = entity.get_prop(player, "m_flLowerBodyYawTarget")
+    if lby ~= nil then
+        if math.abs(lby - data.lby) > 1 then
+            data.last_lby = data.lby
+            data.lby = lby
+            data.lby_updated = true
+            data.lby_time = now
+            data.last_lby_delta = angle_diff(data.lby, data.last_lby)
+        else
+            data.lby_updated = false
+        end
+    end
+
+    local speed = get_velocity_2d(data.velocity)
+    if math.abs(speed - data.last_velocity) < 0.1 and data.moving then
+        data.stuck_ticks = data.stuck_ticks + 1
+    else
+        data.stuck_ticks = 0
+    end
+    data.last_velocity = speed
+
+    table.insert(data.history, 1, {
+        tick = now,
+        origin = {x = data.origin.x, y = data.origin.y, z = data.origin.z},
+        velocity = {x = data.velocity.x, y = data.velocity.y},
+        feet_yaw = data.animstate.current_feet_yaw,
+        goal_yaw = data.animstate.goal_feet_yaw,
+        lby = data.lby,
+        on_ground = data.animstate.on_ground,
+        ducking = data.ducking,
+        time = globals.curtime()
+    })
+
+    while #data.history > 64 do
+        table.remove(data.history)
+    end
+
+    data.last_update_time = globals.curtime()
+
+    if data.in_air then
+        data.in_air_time = data.in_air_time + globals.tickinterval()
+    else
+        data.in_air_time = 0
+    end
+
+    data.teleport_detected = is_teleport(data)
+    data.velocity_penalty = calculate_speed_penalty(data.velocity)
+
+    -- Backtrack record
+    table.insert(data.backtrack_records, 1, {
+        tick = now,
+        origin = {x=data.origin.x, y=data.origin.y, z=data.origin.z},
+        yaw = data.animstate.current_feet_yaw,
+        time = globals.curtime()
+    })
+    while #data.backtrack_records > 200 do
+        table.remove(data.backtrack_records)
+    end
+end
+
+local function estimate_desync_delta(data)
+    local delta = angle_diff(data.animstate.goal_feet_yaw, data.animstate.current_feet_yaw)
+    delta = math.min(delta, get_max_desync_delta())
+    return delta
+end
+
+local function is_moving_on_ground(data)
+    return data.moving and data.animstate.on_ground
+end
+
+local function is_slow_walk(player)
+    return is_moving(player) and get_velocity_2d({x = entity.get_prop(player, "m_vecVelocity[0]") or 0, y = entity.get_prop(player, "m_vecVelocity[1]") or 0}) < 40
+end
+
+-- === Resolver Mode Settings ===
+local resolver_group = ui.create("Advanced Resolver")
+local enable = resolver_group:switch("Enable Resolver", true)
+local debug_log = resolver_group:switch("Enable Debug Log", false)
+local auto_correct = resolver_group:switch("Auto Correct Angles", true)
+local prediction_mode = resolver_group:combo("Prediction Mode", "Default", "Brute Force", "Body Break")
+local resolve_timeout = resolver_group:slider("Resolve Timeout (s)", 0.1, 3.0, 1.0, 10)
+local force_brute = resolver_group:switch("Force Brute on Miss", true)
+local max_brute_steps = resolver_group:slider("Max Brute Steps", 1, 9, 5, 1)
+local use_lby = resolver_group:switch("Use LBY Detection", true)
+local friction_comp = resolver_group:slider("Friction Compensation", 0.0, 1.0, 0.02, 100)
+local gravity_comp = resolver_group:slider("Gravity Compensation", 0.0, 2000.0, 800.0, 1)
+
+-- === Advanced Resolver Settings ===
+local enable_prediction = resolver_group:switch("Enable Position Prediction", true)
+local latency_compensation = resolver_group:switch("Latency Compensation", true)
+local max_error_correction = resolver_group:slider("Max Error Correction", 0, 100, 50, 1)
+local resolve_on_shot = resolver_group:switch("Resolve On Shot", true)
+local hit_log = resolver_group:switch("Log Hits/Misses", true)
+local anti_freestand = resolver_group:switch("Enable Anti-Freestand", true)
+local lby_delta_threshold = resolver_group:slider("LBY Delta Threshold", 1, 180, 90, 1)
+local velocity_weight = resolver_group:slider("Velocity Weight", 0.0, 1.0, 0.5, 100)
+local on_ground_weight = resolver_group:slider("On-Ground Weight", 0.0, 1.0, 0.8, 100)
+
+-- === Backtrack Settings ===
+local enable_backtrack = resolver_group:switch("Enable Backtrack", true)
+local backtrack_ticks = resolver_group:slider("Backtrack Ticks", 1, 200, 20, 1)
+local backtrack_jitter = resolver_group:slider("Jitter Threshold", 0, 180, 45, 1)
+local backtrack_mode = resolver_group:combo("Backtrack Mode", "Latest", "Oldest", "Best Angle", "Center")
+
+
+
+local jitter_correction = resolver_group:switch("Enable Jitter Correction", true)
+local resolve_jitter = resolver_group:slider("Jitter Resolve Angle", -180, 180, 0, 1)
+local force_brute = resolver_group:switch("Force Brute on Miss", true)
+local max_brute_steps = resolver_group:slider("Max Brute Steps", 1, 9, 5, 1)
+local anti_freestand = resolver_group:switch("Enable Anti-Freestand", true)
+local lby_delta_threshold = resolver_group:slider("LBY Delta Threshold", 1, 180, 90, 1)
+local use_lby = resolver_group:switch("Use LBY Detection", true)
+
+
+ 
+ 
+local prioritize_lby_update = resolver_group:switch("Prioritize LBY Update", true)
+local backtrack_on_miss = resolver_group:switch("Backtrack on Miss", true)
+
+local fix_eye_angles = resolver_group:switch("Sync Eye Angles", false)
+local override_mode = resolver_group:combo("Override Mode", "Latest", "Brute", "LBY", "Eye Yaw")
+local smoothing_enabled = resolver_group:switch("Enable Smoothing", false)
+local smoothing_factor = resolver_group:slider("Smoothing Factor", 0, 100, 1, 1)
+
+
+local min_hitchance_override = resolver_group:slider("Min Hit Chance", 0, 100, 85, 1)
+local min_hitchance_override_body = resolver_group:slider("Min HC Body", 0, 100, 75, 1)
+local min_hitchance_override_head = resolver_group:slider("Min HC Head", 0, 100, 90, 1)
+local shot_delay_mode = resolver_group:combo("Shot Delay Mode", "Off", "Static", "Random")
+local shot_delay_value = resolver_group:slider("Shot Delay (ms)", 0, 200, 50, 1)
+local shot_delay_random_min = resolver_group:slider("Random Delay Min", 0, 150, 20, 1)
+local shot_delay_random_max = resolver_group:slider("Random Delay Max", 0, 200, 100, 1)
+local jitter_correction = resolver_group:switch("Jitter Correction", true)
+local resolve_jitter = resolver_group:slider("Jitter Resolve Angle", -180, 180, 0, 1)
+
+-- === Animation Fix ==
+local fix_feet_yaw = resolver_group:switch("Fix Feet Yaw", true)
+local fix_torso_yaw = resolver_group:switch("Fix Torso Yaw", true)
+local fix_pitch = resolver_group:switch("Fix Pitch", true)
+
+
+local last_override = {}
+local function apply_animation_fix(player, data)
+    if not (fix_feet_yaw:get() or fix_torso_yaw:get() or fix_pitch:get() or fix_eye_angles:get()) then return end
+
+    local idx = entity.get_index(player)
+    local target_yaw = get_override_yaw(player, data)
+
+    if smoothing_enabled:get() and last_override[idx] then
+        target_yaw = lerp(last_override[idx], target_yaw, smoothing_factor:get())
+    end
+
+    if fix_feet_yaw:get() then
+        ragebot.set_override(idx, 0, target_yaw)
+    end
+    if fix_torso_yaw:get() then
+        ragebot.set_override(idx, 1, data.animstate.eye_yaw)
+    end
+    if fix_pitch:get() then
+        ragebot.set_override(idx, 2, 0)
+    end
+    if fix_eye_angles:get() then
+        ragebot.set_override(idx, 3, data.eye_angles.y)
+    end
+
+    last_override[idx] = target_yaw
+end
+
+ 
+
+local function apply_jitter_correction(data)
+    if not jitter_correction:get() then return data.animstate.goal_feet_yaw end
+    local jitter = angle_diff(data.animstate.current_feet_yaw, data.animstate.goal_feet_yaw)
+    if jitter > backtrack_jitter:get() then
+        return data.animstate.goal_feet_yaw + resolve_jitter:get()
+    end
+    return data.animstate.goal_feet_yaw
+end
+
+local function get_override_yaw(player, data)
+    local mode = override_mode:get()
+    if mode == "Latest" then
+        return data.animstate.goal_feet_yaw
+    elseif mode == "Brute" then
+        return get_brute_force_angle(data.animstate.goal_feet_yaw, data.brute_force_step)
+    elseif mode == "LBY" then
+        return data.lby
+    elseif mode == "Eye Yaw" then
+        return data.animstate.eye_yaw
+    end
+    return data.animstate.goal_feet_yaw
+end
+
+
+local function log(...)
+    if debug_log:get() then
+        print("[Resolver] ", ...)
+    end
+end
+
+local function on_shot(event)
+    if not hit_log:get() then return end
+    log("Shot fired at target")
+end
+
+local function on_hit(event)
+    local idx = event.userid
+    local player = client.userid_to_entindex(idx)
+    if player == 0 then return end
+    local data = get_player_data(player)
+    data.hit_counter = data.hit_counter + 1
+    data.last_hit_time = globals.curtime()
+    data.missed_shots = 0
+    if hit_log:get() then
+        log("Hit registered on", entity.get_player_name(player))
+    end
+end
+
+local function on_miss(event)
+    local idx = event.userid
+    local player = client.userid_to_entindex(idx)
+    if player == 0 then return end
+    local data = get_player_data(player)
+    data.missed_shots = data.missed_shots + 1
+    data.resolve_override = true
+    if hit_log:get() then
+        log("Miss detected on", entity.get_player_name(player), "Miss count:", data.missed_shots)
+    end
+end
+
+ 
+
+local function resolve_yaw(player, data)
+    local delta = estimate_desync_delta(data)
+    local mode = 0
+    local resolved_yaw = data.animstate.goal_feet_yaw
+
+    -- Force Brute on Miss
+    if force_brute:get() and data.missed_shots > 0 then
+        mode = 6
+        resolved_yaw = get_brute_force_angle(data.animstate.goal_feet_yaw, data.brute_force_step)
+        data.brute_force_step = (data.brute_force_step + 1) % max_brute_steps:get()
+    elseif data.teleport_detected then
+        mode = 5
+        resolved_yaw = data.animstate.current_feet_yaw
+    elseif data.moving then
+        mode = 1
+        resolved_yaw = data.animstate.eye_yaw
+    elseif delta > 40 then
+        mode = 2
+        if data.animstate.current_feet_yaw < data.animstate.goal_feet_yaw then
+            resolved_yaw = data.animstate.goal_feet_yaw - 58
+        else
+            resolved_yaw = data.animstate.goal_feet_yaw + 58
+        end
+    elseif data.lby_updated and data.lby_time == globals.tickcount() then
+        mode = 3
+        resolved_yaw = data.lby
+    elseif data.stuck_ticks > 5 then
+        mode = 4
+        resolved_yaw = data.animstate.goal_feet_yaw + 180
+    elseif is_slow_walk(player) then
+        mode = 7
+        resolved_yaw = data.animstate.eye_yaw + 10
+    else
+        mode = 0
+    end
+
+    -- Jitter Correction
+    if jitter_correction:get() then
+        local jitter = angle_diff(data.animstate.current_feet_yaw, data.animstate.goal_feet_yaw)
+        if jitter > backtrack_jitter:get() then
+            resolved_yaw = resolved_yaw + resolve_jitter:get()
+        end
+    end
+
+    data.resolver_mode = mode
+    data.resolved_angles[globals.tickcount()] = resolved_yaw
+    data.last_resolve_time = globals.curtime()
+
+    return resolved_yaw
+end
+
+local function apply_animation_fix(player, data)
+    if not (fix_feet_yaw:get() or fix_torso_yaw:get() or fix_pitch:get()) then return end
+    local idx = entity.get_index(player)
+
+    if fix_feet_yaw:get() then
+        ragebot.set_override(idx, 0, data.animstate.goal_feet_yaw)
+    end
+    if fix_torso_yaw:get() then
+        ragebot.set_override(idx, 1, data.animstate.eye_yaw)
+    end
+    if fix_pitch:get() then
+        ragebot.set_override(idx, 2, 0)
+    end
+end
+
+local function apply_backtrack(player, data)
+    if not enable_backtrack:get() or #data.backtrack_records == 0 then return end
+
+    local mode = backtrack_mode:get()
+    local record = nil
+
+    if mode == "Latest" then
+        record = data.backtrack_records[1]
+    elseif mode == "Oldest" then
+        record = data.backtrack_records[#data.backtrack_records]
+    elseif mode == "Center" then
+        local mid = math.floor(#data.backtrack_records / 2) + 1
+        record = data.backtrack_records[mid]
+    elseif mode == "Best Angle" then
+        local best_diff = 180
+        for i = 1, #data.backtrack_records do
+            local diff = angle_diff(data.animstate.goal_feet_yaw, data.backtrack_records[i].yaw)
+            if diff < best_diff then
+                best_diff = diff
+                record = data.backtrack_records[i]
+            end
+        end
+    end
+
+    if record then
+        ragebot.set_position(player, record.origin.x, record.origin.y, record.origin.z)
+    end
+end
+
+local function Resolver()
+    -- === 🔒 Защита от вызова до инициализации ===
+    if not entity or not entity.get_prop or not client then
+        return
+    end
+
+    if not enable:get() then return end
+
+    local me = entity.get_local_player()
+    if not me or me == 0 then return end
+
+    local my_health = entity.get_prop(me, "m_iHealth")
+    if my_health == nil or my_health <= 0 then return end
+    -- === 🔚 Конец защиты ===
+
+    local interp_ticks = latency_compensation:get() and get_interpolation_ticks() or 0
+
+    for _, player in ipairs(entity.get_players(true)) do
+        if not is_player_valid(player) or player == me then goto continue end
+
+        update_player_data(player)
+        local data = get_player_data(player)
+
+        -- Anti-freestand logic
+        if anti_freestand:get() and #data.history >= 2 then
+            local h1, h2 = data.history[1], data.history[2]
+            local side1 = angle_diff(h1.goal_yaw, h1.feet_yaw)
+            local side2 = angle_diff(h2.goal_yaw, h2.feet_yaw)
+            if side1 > 50 and side2 > 50 and side1 ~= side2 then
+                data.resolve_override = true
+            end
+        end
+
+        local resolved_yaw = resolve_yaw(player, data)
+        if auto_correct:get() or data.resolve_override then
+            if resolved_yaw == resolved_yaw then
+                ragebot.set_override(entity.get_index(player), 0, resolved_yaw)
+                data.resolve_override = false
+                log("Applied override", entity.get_player_name(player), "mode:", data.resolver_mode)
+            end
+        end
+
+        apply_animation_fix(player, data)
+        apply_backtrack(player, data)
+
+        if enable_prediction:get() then
+            local predicted = extrapolate_position_advanced(data.origin, data.velocity, interp_ticks, data.animstate.on_ground, data.ducking)
+            if predicted.x == predicted.x and predicted.y == predicted.y and predicted.z == predicted.z then
+                ragebot.set_position(player, predicted.x, predicted.y, predicted.z)
+            end
+        end
+
+        ::continue::
+    end
+end
+
+enable:set_callback(Resolver)
+prediction_mode:set_callback(Resolver)
+debug_log:set_callback(function() end)
+resolve_on_shot:set_callback(Resolver)
+anti_freestand:set_callback(Resolver)
+backtrack_mode:set_callback(Resolver)
+ 
