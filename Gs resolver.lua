@@ -46,7 +46,7 @@ local stop_delay = ui.new_slider("Rage", "Other", "Stop Delay (ms)", -100, 100, 
 
  
 local lagcomp_enabled = ui.new_checkbox("Rage", "Other", "Enable Custom LagComp")
-local lagcomp_ticks = ui.new_slider("Rage", "Other", "LagComp Ticks", 1, 100, 1, true, "", 1)
+local lagcomp_ticks = ui.new_slider("Rage", "Other", "LagComp Ticks", -100, 100, 1, true, "", 1)
 local lagcomp_filter_ground = ui.new_checkbox("Rage", "Other", "Only LagComp on Ground")
 local extrapolate_fix = ui.new_checkbox("Rage", "Other", "Enable Extrapolation Fix")
 local extrapolate_max_ticks = ui.new_slider("Rage", "Other", "Max Extrapolate Ticks", 1, 100, 1, true, "", 1)
