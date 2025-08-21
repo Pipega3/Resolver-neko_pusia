@@ -52,7 +52,7 @@ local extrapolate_fix = ui.new_checkbox("Rage", "Other", "Enable Extrapolation F
 local extrapolate_max_ticks = ui.new_slider("Rage", "Other", "Max Extrapolate Ticks", 1, 100, 1, true, "", 1)
 
  
-local debug_log = ui.new_checkbox("Rage", "Other", "Log Resolver Actions")
+
 
  
 local player_data = setmetatable({}, { __mode = 'k' })
