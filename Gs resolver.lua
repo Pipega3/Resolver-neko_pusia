@@ -29,7 +29,7 @@ ffi.cdef[[
  
 local enabled = ui.new_checkbox("Rage", "Other", "Enable Resolver")
 local resolver_mode = ui.new_combobox("Rage", "Other", "Resolver Mode", 
-    "Adaptive", "Brute Force", "State-Based", "Max Desync", "LBY Sync", "Crouch Fix")
+    "Adaptive", "Brute Force", "Static velocity", "Max Desync", "Desync angles Sync", "Crouch Fix")
     local bone_priority = ui.new_multiselect("Rage", "Other", "Bone Priority", "Head", "Neck", "Upper Chest", "Lower Chest", "Stomach", "Fast Body")
 local brute_steps = ui.new_slider("Rage", "Other", "Brute Steps", 1, 8, 3, true, "", 1)
 local crouch_prediction = ui.new_checkbox("Rage", "Other", "Enable Crouch Prediction Fix")
@@ -46,13 +46,15 @@ local stop_delay = ui.new_slider("Rage", "Other", "Stop Delay (ms)", -100, 100, 
 
  
 local lagcomp_enabled = ui.new_checkbox("Rage", "Other", "Enable Custom LagComp")
+local backtrack_enabled = ui.new_checkbox("Rage", "Other", "Enable extend backtrack")
+
 local lagcomp_ticks = ui.new_slider("Rage", "Other", "LagComp Ticks", -100, 100, 1, true, "", 1)
 local lagcomp_filter_ground = ui.new_checkbox("Rage", "Other", "Only LagComp on Ground")
 local extrapolate_fix = ui.new_checkbox("Rage", "Other", "Enable Extrapolation Fix")
 local extrapolate_max_ticks = ui.new_slider("Rage", "Other", "Max Extrapolate Ticks", 1, 100, 1, true, "", 1)
 
  
-
+ 
 
  
 local player_data = setmetatable({}, { __mode = 'k' })
@@ -140,12 +142,12 @@ local function resolve_player(player)
                 entity.set_prop(player, "m_angEyeAngles[1]", normalize_yaw(lby + offset))
             end
             return
-        elseif mode == "State-Based" then
+        elseif mode == "Static velocity" then
             resolved_yaw = not on_ground and normalize_yaw(eye_yaw + max_desync) or
                            speed2d < 5 and lby or normalize_yaw(eye_yaw + max_desync)
         elseif mode == "Max Desync" then
             resolved_yaw = normalize_yaw(eye_yaw + max_desync)
-        elseif mode == "LBY Sync" then
+        elseif mode == "Desync angles Sync" then
             resolved_yaw = lby
         end
     end
@@ -153,12 +155,7 @@ local function resolve_player(player)
     if resolved_yaw ~= resolved_yaw then resolved_yaw = eye_yaw end
     entity.set_prop(player, "m_angEyeAngles[1]", resolved_yaw)
 
-    if ui.get(debug_log) then
-        client.log(string.format("Resolved %d | Mode: %s | Yaw: %.1f | LBY: %.1f | Duck: %.2f | Desync: %.1f", 
-            player, mode, resolved_yaw, lby, duck_amount, max_desync))
-    end
 end
-
  
 local weapon_data = {
     ["weapon_awp"] = { spread = 0.010 }, ["weapon_m4a1"] = { spread = 0.014 }, ["weapon_ak47"] = { spread = 0.014 },
@@ -203,22 +200,44 @@ end
 
  
 local function extrapolate_position(player, record, ticks)
-    if not ui.get(extrapolate_fix) then return record.origin end
-
-    local velocity = { entity.get_prop(player, "m_vecVelocity[0]"), entity.get_prop(player, "m_vecVelocity[1]") }
-    local speed2d = math.sqrt(velocity[1]^2 + velocity[2]^2)
+ 
+    if not ui.get(extrapolate_fix) then 
+        return record.origin 
+    end
 
    
-    if speed2d < 5 then return record.origin end
+    local velocity = { 
+        entity.get_prop(player, "m_vecVelocity[0]"), 
+        entity.get_prop(player, "m_vecVelocity[1]") 
+    }
 
-    local interval = globals.tickinterval()
-    local forward = velocity[1] * interval * ticks
-    local side = velocity[2] * interval * ticks
+     
+    local speed2d = math.sqrt(velocity[1]^2 + velocity[2]^2)
 
+     
+    if speed2d < 5 then 
+        return record.origin 
+    end
+
+    
+    local tick_interval = globals.tickinterval()
+    if tick_interval <= 0 then 
+        return record.origin   
+    end
+
+ 
+    local normalized_forward = velocity[1] / speed2d
+    local normalized_side   = velocity[2] / speed2d
+
+ 
+    local total_forward = normalized_forward * speed2d * tick_interval * ticks
+    local total_side    = normalized_side   * speed2d * tick_interval * ticks
+
+ 
     return {
-        record.origin[1] + forward,
-        record.origin[2] + side,
-        record.origin[3]
+        record.origin[1] + total_forward,
+        record.origin[2] + total_side,
+        record.origin[3]   
     }
 end
 
@@ -275,11 +294,11 @@ client.set_event_callback("paint", function()
                
             end
 
-            local data = get_backtrack_data(player)
-            local origin = { entity.get_prop(player, "m_vecOrigin") }
-            local lby = entity.get_prop(player, "m_flLowerBodyYawTarget")
-            local eye_yaw = entity.get_prop(player, "m_angEyeAngles[1]")
-            local sim_time = entity.get_prop(player, "m_flSimulationTime")
+                local data = get_backtrack_data(player)
+                local origin = { entity.get_prop(player, "m_vecOrigin") }
+                local lby = entity.get_prop(player, "m_flLowerBodyYawTarget")
+                local eye_yaw = entity.get_prop(player, "m_angEyeAngles[1]")
+                local sim_time = entity.get_prop(player, "m_flSimulationTime")
 
             table.insert(data, 1, {
                 origin = origin,
@@ -293,7 +312,7 @@ client.set_event_callback("paint", function()
             while #data > max_ticks do table.remove(data, #data) end
         end
     end
-
+ 
   
     for i = 1, #enemies do
         local player = enemies[i]
@@ -312,17 +331,70 @@ client.set_event_callback("paint", function()
         end
 
       
-        local record = get_best_record(player)
+               local record = get_best_record(player)
         if record then
-            local extrapolate_ticks = ui.get(extrapolate_max_ticks)
+            local extrapolate_ticks = globals.tickcount() - record.tick
             local predicted_origin = extrapolate_position(player, record, extrapolate_ticks)
 
-            
-            entity.set_prop(player, "m_vecOrigin", unpack(predicted_origin))
-            entity.set_prop(player, "m_flLowerBodyYawTarget", record.lby)
-            entity.set_prop(player, "m_angEyeAngles[1]", record.eye_yaw)
+           
+            local current_origin = { entity.get_prop(player, "m_vecOrigin") }
+            local lerped_origin = {
+                current_origin[1] + (predicted_origin[1] - current_origin[1]) * 0.3,
+                current_origin[2] + (predicted_origin[2] - current_origin[2]) * 0.3,
+                predicted_origin[3]
+            }
+
+          
+            local eye_yaw = entity.get_prop(player, "m_angEyeAngles[1]")
+            if not eye_yaw or angle_diff(eye_yaw, record.eye_yaw) < 90 then
+                entity.set_prop(player, "m_vecOrigin", unpack(lerped_origin))
+                entity.set_prop(player, "m_flLowerBodyYawTarget", record.lby)
+                entity.set_prop(player, "m_angEyeAngles[1]", record.eye_yaw)
+
+             
+                local animstate = ffi.cast("struct animstate_t*", entity.get_prop(player, "m_PlayerAnimState"))
+                if animstate ~= nil then
+                    animstate.m_flEyeYaw = record.eye_yaw
+                    animstate.m_flGoalFeetYaw = record.eye_yaw
+                end
+            end
         end
 
+        if record then
+            local extrapolate_ticks = globals.tickcount() - record.tick
+            local predicted_origin = extrapolate_position(player, record, extrapolate_ticks)
+
+            local current_origin = { entity.get_prop(player, "m_vecOrigin") }
+            if not current_origin[1] then goto next_player end
+
+         
+            local lerp_factor = 0.3
+            local lerped_origin = {
+                current_origin[1] + (predicted_origin[1] - current_origin[1]) * lerp_factor,
+                current_origin[2] + (predicted_origin[2] - current_origin[2]) * lerp_factor,
+                predicted_origin[3]
+            }
+
+           
+            local eye_yaw = entity.get_prop(player, "m_angEyeAngles[1]")
+            if eye_yaw and angle_diff(eye_yaw, record.eye_yaw) < 90 then
+                entity.set_prop(player, "m_vecOrigin", unpack(lerped_origin))
+                entity.set_prop(player, "m_flLowerBodyYawTarget", record.lby)
+                entity.set_prop(player, "m_angEyeAngles[1]", record.eye_yaw)
+
+               
+                local animstate_ptr = entity.get_prop(player, "m_PlayerAnimState")
+                if animstate_ptr ~= nil then
+                    local animstate = ffi.cast("struct animstate_t*", animstate_ptr)
+                    if animstate ~= nil then
+                        animstate.m_flEyeYaw = record.eye_yaw
+                        animstate.m_flGoalFeetYaw = record.eye_yaw
+                    end
+                end
+            end
+        end
+
+          ::next_player::
        
         resolve_player(player)
             end
@@ -373,22 +445,30 @@ end
 
  
 local function get_best_record(player)
-    if not ui.get(backtrack_enabled) then return nil end
+  
+    if not ui.get(backtrack_enabled) then
+        return nil
+    end
 
+  
     local data = get_backtrack_data(player)
-    if #data == 0 then return nil end
-
-    local latency = client.latency()
-    local correct = latency + globals.interp_amount()
+    if not data or #data == 0 then
+        return nil
+    end
+ 
     local curtime = globals.curtime()
+    local correct = client.latency() + globals.interp_amount()
+
     local target_time = curtime - correct
-
     local best_record = nil
-    local best_diff = math.huge
+    local best_diff = 1e9   
 
+   
     for i = 1, #data do
         local record = data[i]
-        local diff = math.abs(record.sim_time - target_time)
+        local diff = record.sim_time - target_time
+        diff = (diff >= 0) and diff or -diff   
+
         if diff < best_diff then
             best_diff = diff
             best_record = record
@@ -416,6 +496,5 @@ client.set_event_callback("setup_command", function(cmd)
             end
         end)
     end
-end)
-
- 
+end) 
+  
